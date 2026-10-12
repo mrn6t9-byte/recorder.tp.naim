@@ -22,7 +22,13 @@ UA = E("UA") or "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KH
 REFERER = E("REFERER") or ""
 API_ID, API_HASH = E("TG_API_ID", ""), E("TG_API_HASH", "")   # optional: lets the bot upload files up to 2 GB
 BIG_LIMIT = 1950 * 1000 * 1000
-HDR = ["-user_agent", UA] + (["-referer", REFERER] if REFERER else [])
+def _origin(u):
+    m = re.match(r"^(https?://[^/]+)", u or "")
+    return m.group(1) if m else ""
+
+
+# browsers send Referer + Origin; some stream servers refuse requests without them
+HDR = ["-user_agent", UA] + (["-referer", REFERER] + (["-headers", "Origin: %s\r\n" % _origin(REFERER)] if _origin(REFERER) else []) if REFERER else [])
 
 
 def mask(t):
@@ -226,13 +232,64 @@ def uploader():
         time.sleep(5)
 
 
+def explain(err):
+    e = (err or "").lower()
+    if "403" in e or "forbidden" in e:
+        return "403 Forbidden: the stream server refuses GitHub's server. Country/IP block, or the link needs a login or an expired token."
+    if "401" in e or "unauthorized" in e:
+        return "401 Unauthorized: the link needs a login or its token is wrong or expired."
+    if "404" in e or "not found" in e:
+        return "404 Not found: the link has expired or is wrong. Copy a fresh link and try again."
+    if "timed out" in e or "timeout" in e:
+        return "Connection timed out: the server does not answer GitHub's server. Usually an IP/country block."
+    if "could not resolve" in e or "name or service not known" in e or "nodename" in e:
+        return "The website name in the link could not be found. Check the link for typing mistakes."
+    if "invalid data found" in e:
+        return "This link is not a video playlist (.m3u8). Open it in a browser: it should give a playlist, not a web page."
+    if "connection refused" in e or "reset by peer" in e or "end of file" in e:
+        return "The server closed the connection. Usually it blocks GitHub's server."
+    return "Unknown reason. Read the ffmpeg line above."
+
+
+def summary(text):
+    p = E("GITHUB_STEP_SUMMARY")
+    if p:
+        try:
+            with open(p, "a") as f:
+                f.write(text + "\n")
+        except OSError:
+            pass
+
+
+def header_sets():
+    """Browser-like request headers to try. Some servers refuse requests that have no Referer/Origin."""
+    sets = []
+    if REFERER:
+        o = _origin(REFERER)
+        sets.append(("the referer you gave", ["-user_agent", UA, "-referer", REFERER] + (["-headers", "Origin: %s\r\n" % o] if o else [])))
+    sets.append(("a normal browser User-Agent", ["-user_agent", UA]))
+    o = _origin(URL)
+    if o:
+        sets.append(("browser headers with the stream's own site as referer", ["-user_agent", UA, "-referer", o + "/", "-headers", "Origin: %s\r\n" % o]))
+    return sets
+
+
 def precheck():
-    try:
-        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error"] + HDR + ["-t", "6", "-i", URL, "-f", "null", "-"],
-                           capture_output=True, text=True, timeout=90)
-        return r.returncode == 0, mask((r.stderr or "").strip())[-400:]
-    except Exception as e:
-        return False, str(e)
+    global HDR
+    last = ""
+    for label, hdr in header_sets():
+        try:
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error"] + hdr + ["-t", "6", "-i", URL, "-f", "null", "-"],
+                               capture_output=True, text=True, timeout=90)
+        except Exception as e:
+            last = str(e); continue
+        if r.returncode == 0:
+            HDR = hdr
+            print("Link opened using: " + label, flush=True)
+            return True, ""
+        last = mask((r.stderr or "").strip())[-400:]
+        print("Could not open with %s: %s" % (label, last.splitlines()[-1] if last else "?"), flush=True)
+    return False, last
 
 
 def where():
@@ -257,8 +314,11 @@ def record():
     detect_chat()
     ok, err = precheck()
     if not ok:
+        why = explain(err)
         print("PRECHECK FAILED. ffmpeg said:\n" + err, flush=True)
-        say("The link could not be opened from GitHub's server.\nLikely geo/IP blocked or the token expired.\nffmpeg said: " + err)
+        print("::error title=Link could not be opened from GitHub::" + why, flush=True)
+        summary("## Recording did not start\n**Reason:** " + why + "\n\n```\n" + err + "\n```")
+        say("The link could not be opened from GitHub's server.\nReason: " + why + "\nffmpeg said: " + err[-300:])
         sys.exit(1)
     say("Recording started on GitHub (%s)\nRunner location: %s\nFiles will appear here: %s\nSend /status or /stop." % (NAME, where(), REL_URL))
     signal.signal(signal.SIGINT, lambda *a: halt())
@@ -293,6 +353,7 @@ def record():
         time.sleep(5)
     state["finished"] = True
     up.join()
+    summary("## Recording finished\n%d file(s), %s. [Open the release](%s)" % (state["uploaded"], human(state["bytes"]), REL_URL))
     say("Recording finished. %d file(s), %s.\nDownload: %s" % (state["uploaded"], human(state["bytes"]), REL_URL))
 
 
