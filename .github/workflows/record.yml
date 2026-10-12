@@ -13,7 +13,7 @@ on:
         default: "ClipByNaim"
       part_min:
         description: "Minutes per file (20 is safe, GitHub allows 2 GB per file)"
-        default: "20"
+        default: "120"
 
 permissions:
   contents: write     # upload recordings to a Release
