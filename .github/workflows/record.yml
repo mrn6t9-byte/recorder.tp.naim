@@ -1,4 +1,4 @@
-name: Record
+name: Naim X Record
 on:
   workflow_dispatch:
     inputs:
@@ -7,7 +7,7 @@ on:
         required: true
       minutes:
         description: "Stop after N minutes (0 = until you send /stop)"
-        default: "120"
+        default: "300"
       name:
         description: "File name"
         default: "ClipByNaim"
