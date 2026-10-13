@@ -1,66 +1,70 @@
-name: Stream Recorder
-
+name: Record
 on:
   workflow_dispatch:
     inputs:
-      stream_url:
-        description: "Authorized .m3u8 or .ts URL"
+      url:
+        description: "m3u8 link"
         required: true
-        type: string
-      duration_hours:
-        description: "Recording duration"
-        required: true
-        type: choice
-        options:
-          - "4"
-          - "8"
-        default: "4"
-      segment_mb:
-        description: "Approximate segment size"
-        required: true
-        type: choice
-        options:
-          - "1900"
-          - "1000"
-          - "500"
+      minutes:
+        description: "Stop after N minutes (0 = until you send /stop)"
+        default: "120"
+      name:
+        description: "File name"
+        default: "ClipByNaim"
+      part_min:
+        description: "New file every N minutes (60 = auto-save every hour while recording continues)"
+        default: "60"
+      part_mb:
+        description: "...or every N MB, whichever comes first (GitHub allows under 2000 MB per file)"
         default: "1900"
+      referer:
+        description: "Optional: website the link is played on (only if the link needs it)"
+        required: false
+        default: ""
 
 permissions:
-  contents: read
+  contents: write     # upload recordings to a Release
+  actions: write      # lets a long recording continue in a new run
 
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-
+    timeout-minutes: 355
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      SHA: ${{ github.sha }}
+      URL: ${{ inputs.url }}
+      MINUTES: ${{ inputs.minutes }}
+      NAME: ${{ inputs.name }}
+      PART_MIN: ${{ inputs.part_min }}
+      PART_MB: ${{ inputs.part_mb }}
+      REFERER: ${{ inputs.referer }}
+      TG_API_ID: ${{ secrets.TG_API_ID }}
+      TG_API_HASH: ${{ secrets.TG_API_HASH }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Record stream
-        env:
-          STREAM_URL: ${{ inputs.stream_url }}
-          DURATION_HOURS: ${{ inputs.duration_hours }}
-          SEGMENT_MB: ${{ inputs.segment_mb }}
-          OUTPUT_DIR: output
-        run: python -m recorder.recorder
-
-      - name: Upload recording
+          python-version: "3.11"
+      - name: Install Telegram uploader (only if TG_API_ID is set)
+        if: ${{ env.TG_API_ID != '' }}
+        run: python -m pip install pyrogram tgcrypto || python -m pip install pyrogram
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Record
+        run: python gh_record.py
+      - name: Upload leftovers if cancelled
+        if: always()
+        run: python gh_record.py finish
+      - name: Keep files that failed to upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stream-recording-${{ github.run_id }}
-          path: output/
-          if-no-files-found: warn
-          compression-level: 0
-          retention-days: 7
+          name: failed-uploads
+          path: rec_failed/
+          if-no-files-found: ignore
+          retention-days: 3
