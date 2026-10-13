@@ -1,52 +1,65 @@
-name: Record
-on:
-  workflow_dispatch:
-    inputs:
-      url:
-        description: "m3u8 link"
-        required: true
-      minutes:
-        description: "Stop after N minutes (0 = until you send /stop)"
-        default: "480"
-      name:
-        description: "File name"
-        default: "ClipByNaim"
-      part_min:
-        description: "Minutes per file (20 is safe, GitHub allows 2 GB per file)"
-        default: "120"
+"""Record an authorized HLS (.m3u8) or direct MPEG-TS (.ts) stream.
 
-permissions:
-  contents: write     # upload recordings to a Release
-  actions: write      # lets a long recording continue in a new run
+Important: GitHub Actions uploads artifacts after the job ends. This workflow
+does not upload hourly snapshots while FFmpeg is running.
+"""
+import os
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
 
-jobs:
-  record:
-    runs-on: ubuntu-latest
-    timeout-minutes: 355
-    env:
-      TG_TOKEN: ${{ secrets.TG_TOKEN }}
-      TG_CHAT: ${{ secrets.TG_CHAT }}
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      RUN_ID: ${{ github.run_id }}
-      URL: ${{ inputs.url }}
-      MINUTES: ${{ inputs.minutes }}
-      NAME: ${{ inputs.name }}
-      PART_MIN: ${{ inputs.part_min }}
-      TG_API_ID: ${{ secrets.TG_API_ID }}
-      TG_API_HASH: ${{ secrets.TG_API_HASH }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install Telegram uploader (only if TG_API_ID is set)
-        if: ${{ env.TG_API_ID != '' }}
-        run: python -m pip install pyrogram tgcrypto || python -m pip install pyrogram
-      - name: Install ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-      - name: Record
-        run: python gh_record.py
-      - name: Upload leftovers if cancelled
-        if: always()
-        run: python gh_record.py finish
+STREAM_URL = os.getenv("STREAM_URL", "").strip()
+DURATION_HOURS = int(os.getenv("DURATION_HOURS", "4"))
+SEGMENT_MB = int(os.getenv("SEGMENT_MB", "1900"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "output"))
+BITRATE_KBPS = int(os.getenv("ESTIMATED_BITRATE_KBPS", "4000"))
+
+
+def validate() -> None:
+    parsed = urlparse(STREAM_URL)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise SystemExit("STREAM_URL must be a valid authorized HTTP(S) URL.")
+    if DURATION_HOURS not in (4, 8):
+        raise SystemExit("DURATION_HOURS must be 4 or 8.")
+    if not 100 <= SEGMENT_MB <= 1900:
+        raise SystemExit("SEGMENT_MB must be between 100 and 1900.")
+    if BITRATE_KBPS <= 0:
+        raise SystemExit("ESTIMATED_BITRATE_KBPS must be positive.")
+
+
+def main() -> None:
+    validate()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    # Estimate segment time. Actual size depends on changing stream bitrate.
+    target_bits = SEGMENT_MB * 1024 * 1024 * 8
+    segment_seconds = max(60, int(target_bits / (BITRATE_KBPS * 1000)))
+    output_pattern = OUTPUT_DIR / f"recording_{stamp}_part%03d.ts"
+    command = [
+        "ffmpeg", "-hide_banner", "-nostdin", "-y",
+        "-rw_timeout", "15000000",
+        "-i", STREAM_URL,
+        "-t", str(DURATION_HOURS * 3600),
+        "-map", "0", "-c", "copy",
+        "-f", "segment",
+        "-segment_time", str(segment_seconds),
+        "-reset_timestamps", "1",
+        "-segment_format", "mpegts",
+        str(output_pattern),
+    ]
+    print(f"Duration: {DURATION_HOURS} hour(s)")
+    print(f"Approximate segment target: {SEGMENT_MB} MB")
+    print(f"FFmpeg segment interval: {segment_seconds} seconds")
+    print("Recording started. Parts will appear in output/ as they are created.")
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(
+            f"FFmpeg failed (exit code {exc.returncode}). Check stream URL and logs."
+        ) from exc
+    print("Recording finished successfully.")
+
+
+if __name__ == "__main__":
+    main()
