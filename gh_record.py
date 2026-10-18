@@ -1,49 +1,57 @@
 #!/usr/bin/env python3
 """Runs inside GitHub Actions.
-Records an HLS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files
-(every PART_MIN minutes, at most PART_MAX_MB, or when you press Split) at keyframes, uploads each finished
-file to a GitHub Release (and to Telegram if TG_API_ID/TG_API_HASH are set) while the recording keeps going.
+Records an HLS / MPEG-TS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
+keyframes every PART_MB megabytes (default 4000 = 4 GB, whatever time that takes) and uploads each finished
+file to Gofile while the recording keeps going. Telegram gets the links, the Status / Split / Stop buttons.
+
+Reconnect behaviour:
+  * a reader thread + big memory queue keep ffmpeg's pipe empty, so a slow disk/upload never makes the server drop us
+  * when ffmpeg has to reconnect, HLS restarts RECON_BACK segments behind live (old data is skipped, nothing is lost)
+  * if the server restarts its clock on reconnect, the timestamps are shifted so the video continues smoothly in the
+    SAME file. A new file is made only at PART_MB (or the Split button), never because of a reconnect.
+
   python gh_record.py            record
   python gh_record.py finish     upload anything left over (used by the always() step)"""
 import os, re, sys, json, glob, time, html, queue, signal, shutil, threading, subprocess, urllib.request, urllib.parse, urllib.error
-from urllib.parse import quote
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 E = os.environ.get
 TOKEN, CHAT = E("TG_TOKEN", ""), E("TG_CHAT", "")
-REPO, RUN, SHA = E("REPO", ""), E("RUN_ID", "local"), E("SHA", "")
+REPO, RUN = E("REPO", ""), E("RUN_ID", "local")
 URL = E("URL", "")
 NAME = re.sub(r"[^\w\-]+", "_", E("NAME") or "ClipByNaim")
 MINUTES = float(E("MINUTES") or 0)             # 0 = until Stop
-PART_MIN = float(E("PART_MIN") or 60)           # a new file every N minutes of video
-PART_MAX = float(E("PART_MB") or E("PART_MAX_MB") or 1900) * 1e6  # ...or when a file reaches this size (GitHub allows 2 GB per file)
+PART_MIN = float(E("PART_MIN") or 0)            # optional: also split every N minutes (0 = off, split by size only)
+PART_MAX = min(float(E("PART_MB") or 4000), 5000) * 1e6   # a new file every N MB (4000 = 4 GB)
 BACK = E("BACK_SEGS") or "5"                    # start N segments behind live (safety)
+RECON_BACK = E("RECON_BACK") or "12"            # after a reconnect (HLS): start N segments behind, repeated data is skipped
 OUT = E("OUT_DIR") or "rec"
-MP4_DIR = E("MP4_DIR") or OUT                    # finished .mp4 files (use a second disk folder for big parts)
+MP4_DIR = E("MP4_DIR") or OUT                    # finished .mp4 files (a different disk folder from the .ts files)
 FAILED = E("FAILED_DIR") or "rec_failed"
-HOST = (E("HOST") or "github").lower()          # github = Release (max 2 GB per file) | gofile = link host for 4 GB files
-GOFILE_URL = E("GOFILE_URL") or "https://upload.gofile.io/uploadfile"
-GF = {"folder": "", "token": ""}
 DRY = E("DRY") == "1"                           # test mode: no uploads
 TEST_ONCE = E("TEST_ONCE") == "1"               # test mode: do not restart when the input ends
-TAG = "rec-" + RUN
+GOFILE_URL = E("GOFILE_URL") or "https://upload.gofile.io/uploadfile"
+IDLE_STOP = float(E("IDLE_STOP_MIN") or 10)     # stop the job when the stream sends no data for N minutes (saves GitHub minutes), 0 = off
+ASKED = False                                   # True when the link came from Telegram (it is kept out of the GitHub page)
+RETRY_BASE = float(E("RETRY_BASE") or 30)       # seconds, grows with every upload retry
+GF = {"folder": "", "token": ""}
 LIMIT = 345 * 60                                # one job runs ~6 h; a new run continues before that
 STAMP = time.strftime("%Y%m%d_%H%M%S")
-REL_URL = "https://github.com/%s/releases/tag/%s" % (REPO, TAG)
 RUN_URL = "https://github.com/%s/actions/runs/%s" % (REPO, RUN)
-
-
-def file_url(name):
-    return "https://github.com/%s/releases/download/%s/%s" % (REPO, TAG, quote(name))
 UA = E("UA") or "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 REFERER = E("REFERER") or ""
-API_ID, API_HASH = E("TG_API_ID", ""), E("TG_API_HASH", "")   # optional: lets the bot upload files up to 2 GB
-BIG_LIMIT = 1950 * 1000 * 1000
 HDR = ["-user_agent", UA]
-if HOST == "github" and PART_MAX > BIG_LIMIT:
-    PART_MAX = BIG_LIMIT                            # GitHub Releases reject files over 2 GB
+
+M33 = 0x1FFFFFFFF                               # 33 bit timestamp mask (90 kHz clock)
+JUMP_BACK = 90000                               # clock went back more than 1 s  -> source restarted
+JUMP_FWD = 270000                               # clock jumped forward more than 3 s -> close the gap, keep it smooth
+DUP_WINDOW = 90000 * 600                        # data up to 10 min older than what we saved counts as "already have it"
 
 stop = threading.Event()
-S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "rel_err": "", "split_msgs": 0}
+S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "page": "", "last_data": time.time(), "reason": "", "qmax": 0}
 upq = queue.Queue()
 SP = None
 
@@ -133,14 +141,63 @@ def summary(text):
 
 
 # ---------------- MPEG-TS splitter (cuts at keyframes, recording never stops) ----------------
-def pes_pts(pk):
+def pes_times(pk):
+    """(pts, dts) of the PES that starts in this packet; dts falls back to pts."""
     afc = (pk[3] >> 4) & 3
     if not afc & 1:
-        return None
+        return None, None
     p = 4 + ((1 + pk[4]) if afc & 2 else 0)
     if p + 14 > 188 or pk[p] or pk[p + 1] or pk[p + 2] != 1 or not (pk[p + 7] & 0x80):
-        return None
-    return ((pk[p + 9] >> 1) & 7) * 1073741824 + ((pk[p + 10] << 22) | ((pk[p + 11] >> 1) << 15) | (pk[p + 12] << 7) | (pk[p + 13] >> 1))
+        return None, None
+    def ts(i):
+        return ((pk[i] >> 1) & 7) * 1073741824 + ((pk[i + 1] << 22) | ((pk[i + 2] >> 1) << 15) | (pk[i + 3] << 7) | (pk[i + 4] >> 1))
+    pts = ts(p + 9)
+    dts = ts(p + 14) if (pk[p + 7] & 0x40) and p + 19 <= 188 else pts
+    return pts, dts
+
+
+def sdiff(a, b):
+    """a - b on the 33 bit clock, as a signed number."""
+    d = (a - b) & M33
+    return d - (1 << 33) if d >= (1 << 32) else d
+
+
+def shift_ts(pk, off):
+    """Return a copy of the packet with PTS, DTS and PCR moved by off (90 kHz ticks)."""
+    b = bytearray(pk)
+    afc = (pk[3] >> 4) & 3
+    if afc & 2 and pk[4] >= 7 and pk[5] & 0x10:                     # PCR in the adaptation field
+        base = ((pk[6] << 25) | (pk[7] << 17) | (pk[8] << 9) | (pk[9] << 1) | (pk[10] >> 7))
+        base = (base + off) & M33
+        b[6] = (base >> 25) & 0xFF; b[7] = (base >> 17) & 0xFF; b[8] = (base >> 9) & 0xFF; b[9] = (base >> 1) & 0xFF
+        b[10] = ((base & 1) << 7) | (pk[10] & 0x7F)
+    if afc & 1 and (pk[1] & 0x40):                                   # PES header with PTS (and DTS)
+        p = 4 + ((1 + pk[4]) if afc & 2 else 0)
+        if p + 14 <= 188 and not pk[p] and not pk[p + 1] and pk[p + 2] == 1 and (pk[p + 7] & 0x80):
+            def put(i):
+                v = (((pk[i] >> 1) & 7) * 1073741824 + ((pk[i + 1] << 22) | ((pk[i + 2] >> 1) << 15) | (pk[i + 3] << 7) | (pk[i + 4] >> 1)) + off) & M33
+                b[i] = (pk[i] & 0xF0) | (((v >> 30) & 7) << 1) | 1
+                b[i + 1] = (v >> 22) & 0xFF
+                b[i + 2] = (((v >> 15) & 0x7F) << 1) | 1
+                b[i + 3] = (v >> 7) & 0xFF
+                b[i + 4] = ((v & 0x7F) << 1) | 1
+            put(p + 9)
+            if (pk[p + 7] & 0x40) and p + 19 <= 188:
+                put(p + 14)
+    return b
+
+
+def vsig(pk):
+    """Fingerprint of a video picture: the first bytes of its data (after the PES header)."""
+    afc = (pk[3] >> 4) & 3
+    p = 4 + ((1 + pk[4]) if afc & 2 else 0)
+    st = p + 9 + pk[p + 8]
+    return bytes(pk[st:min(st + 24, 188)])
+
+
+def same_sig(a, b):
+    n = min(len(a), len(b) if b else 0)
+    return b is not None and n >= 8 and a[:n] == b[:n]
 
 
 class Splitter:
@@ -153,6 +210,36 @@ class Splitter:
         self.pat = None; self.pmt = None; self.pmt_pid = None; self.vid = None
         self.want_split = False; self.manual_flag = False; self.on_manual = None
         self.hist = []
+        self.aud = set(); self.cc = {}; self.last_wr = {}
+        self.off = 0; self.last_out_v = None; self.fdur = 3600; self.rebased = 0     # timestamp shift so reconnects join smoothly
+        self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
+        self.need_key = False; self.need_key_until = 0
+        self.recent = {}; self.verify = False                # dts -> fingerprint of recently saved pictures
+
+    def new_session(self, dedupe=True, verify=False):
+        """ffmpeg was restarted: it re-sends some old data. Drop everything up to the last time we already wrote."""
+        self.buf = b""
+        marks = {k: v for k, v in self.last_wr.items() if v is not None}
+        self.skip = dict(marks) if (marks and dedupe) else None
+        self.dropping = set(); self.drop_bytes = 0
+        # If we skip repeated data, the new data continues right after what is already saved (same picture group),
+        # so no keyframe is needed. Otherwise wait for the next keyframe so there is no broken picture.
+        self.verify = self.skip is not None and verify        # TS: the first old picture must really be one we saved (HLS replays many segments, no check)
+        self.need_key = self.vid is not None and self.skip is None
+        self.need_key_until = time.time() + 20
+        print("New connection. Repeated data dropped so far: %.1f MB" % (self.deduped / 1e6), flush=True)
+
+    def _write(self, pk):
+        pid = ((pk[1] & 0x1f) << 8) | pk[2]
+        b = bytearray(pk)
+        if (pk[3] >> 4) & 1:                              # packet has payload: continue the counter without gaps
+            c = (self.cc.get(pid, -1) + 1) & 15
+            self.cc[pid] = c
+        else:
+            c = self.cc.get(pid, 0)
+        b[3] = (b[3] & 0xF0) | c
+        self.f.write(b)
+        self.last_write = time.time()
 
     def media_secs(self):
         if self.start_pts is None or self.last_pts is None:
@@ -175,7 +262,7 @@ class Splitter:
         self.start_pts = self.last_pts
         for p in (self.pat, self.pmt):                 # every file starts with PAT + PMT, then a keyframe
             if p:
-                self.f.write(p); self.cur_bytes += 188
+                self._write(p); self.cur_bytes += 188
 
     def _close(self):
         if not self.f:
@@ -212,13 +299,16 @@ class Splitter:
         while q + 5 <= end:
             if pk[q] in (0x1b, 0x24, 0x02, 0x10) and self.vid is None:
                 self.vid = ((pk[q + 1] & 31) << 8) | pk[q + 2]
+            elif pk[q] in (0x0f, 0x11, 0x03, 0x04, 0x81, 0x87):
+                self.aud.add(((pk[q + 1] & 31) << 8) | pk[q + 2])
             q += 5 + (((pk[q + 3] & 15) << 8) | pk[q + 4])
 
     def _should_split(self):
+        # only: Split button, optional time limit, or the size limit. A reconnect / clock jump never splits a file.
         if self.want_split:
             self.want_split = False; self.manual_flag = True
             return True
-        return self.media_secs() >= PART_MIN * 60 or self.cur_bytes >= PART_MAX
+        return (PART_MIN > 0 and self.media_secs() >= PART_MIN * 60) or self.cur_bytes >= PART_MAX
 
     def feed(self, data):
         self.buf += data
@@ -234,6 +324,48 @@ class Splitter:
                 continue                                  # drop empty padding packets
             pusi = pk[1] & 0x40
             key = False
+            is_es = pid == self.vid or pid in self.aud
+            pts, dts = pes_times(pk) if (pusi and is_es) else (None, None)
+            if self.skip is not None and is_es:          # after a reconnect: skip data we already have
+                if pusi:
+                    k = "v" if pid == self.vid else pid
+                    last = self.skip.get(k)
+                    fresh = False
+                    if last is None or dts is None:
+                        ahead = True
+                    else:
+                        d = sdiff(dts, last)
+                        ahead = d > 0 or d < -DUP_WINDOW   # newer than what we saved, or the server clock restarted
+                        if not ahead and pid == self.vid and self.verify:
+                            self.verify = False
+                            if not same_sig(vsig(pk), self.recent.get(dts)):
+                                fresh = True               # not a picture we saved: new content with a restarted clock
+                    if fresh:
+                        print("Server restarted its clock with NEW content: nothing is dropped, timeline is joined instead", flush=True)
+                        self.skip = None; self.dropping = set()
+                        self.need_key = True; self.need_key_until = time.time() + 20
+                    elif ahead:
+                        if pid == self.vid and last is not None and dts is not None:
+                            self.verify = False
+                            if not (0 < sdiff(dts, last) <= max(3 * self.fdur, 9000)):
+                                self.need_key = True; self.need_key_until = time.time() + 20   # not the very next picture: gap, wait for keyframe
+                        self.skip.pop(k, None); self.dropping.discard(pid)
+                        if not self.skip:
+                            self.skip = None
+                    else:
+                        self.dropping.add(pid)
+                if pid in self.dropping:
+                    self.drop_bytes += 188; self.deduped += 188
+                    if self.drop_bytes > 400_000_000:     # timestamps do not match: stop skipping, keep recording
+                        self.skip = None; self.dropping = set()
+                    continue
+            if self.need_key and is_es:
+                if pid == self.vid and pusi and (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
+                    self.need_key = False
+                elif time.time() > self.need_key_until:
+                    self.need_key = False
+                else:
+                    continue
             if pid == 0 and pusi:
                 self._pat(pk)
                 if self.vid is None and self.pmt:
@@ -241,11 +373,29 @@ class Splitter:
             elif pid == self.pmt_pid and pusi:
                 self._pmt(pk)
             elif pid == self.vid and pusi:
-                pts = pes_pts(pk)
                 if pts is not None:
-                    self.last_pts = pts
+                    lastv = self.last_wr.get("v")
+                    if lastv is not None and self.skip is None:
+                        dd = sdiff(dts, lastv)
+                        if dd < -JUMP_BACK or dd > JUMP_FWD:
+                            # the server clock jumped (reconnect / restart): shift all following timestamps so the
+                            # picture continues one frame after the last one. Same file, no cut, no freeze.
+                            if self.last_out_v is not None:
+                                self.off = (self.last_out_v + self.fdur - dts) & M33
+                                self.rebased += 1
+                                print("Clock jump %+.1fs: timeline joined smoothly (join #%d)" % (dd / 90000.0, self.rebased), flush=True)
+                        elif 0 < dd <= 18000:
+                            self.fdur = dd                # normal picture spacing, used to place the first picture after a join
+                    self.last_pts = (pts + self.off) & M33
+                    self.last_out_v = (dts + self.off) & M33
+                    self.last_wr["v"] = dts               # raw value, used to skip repeated data after a reconnect
+                    self.recent[dts] = vsig(pk)
+                    if len(self.recent) > 3000:
+                        del self.recent[next(iter(self.recent))]
                 if (pk[3] >> 4) & 2 and pk[4] > 0 and (pk[5] & 0x40):
                     key = True                            # random access indicator = keyframe starts here
+            elif pid in self.aud and pusi and dts is not None:
+                self.last_wr[pid] = dts
             if self.f is None:
                 if (key or (self.vid is None and self.pmt and pid not in (0, self.pmt_pid))) and (self.pat and self.pmt):
                     self._open()
@@ -257,10 +407,17 @@ class Splitter:
                     self.manual_flag = False
                     if self.on_manual:
                         self.on_manual(self.part_no)
-            self.f.write(pk); self.cur_bytes += 188
+            if self.off and (pts is not None or ((pk[3] >> 4) & 2 and pk[4] >= 7 and pk[5] & 0x10)):
+                pk = shift_ts(pk, self.off)
+            self._write(pk); self.cur_bytes += 188
+            if is_es:
+                self.last_es = time.time()                # real video/audio data was saved (not just PAT/PMT)
         self.total += end - i
         self.buf = buf[end:]
-        self.hist.append((time.time(), self.total))
+        now = time.time()
+        self.hist.append((now, self.total))
+        if len(self.hist) > 1500:
+            self.hist = [h for h in self.hist if now - h[0] <= 15]
 
 
 # ---------------- messages ----------------
@@ -272,10 +429,11 @@ def status_text():
     spd = sp.speed_mbps() if sp else 0
     nxt = ""
     if sp and sp.f:
-        t_left = PART_MIN * 60 - sp.media_secs()
+        t_left = (PART_MIN * 60 - sp.media_secs()) if PART_MIN > 0 else 1e12
         if spd > 0.1:
             t_left = min(t_left, (PART_MAX - sp.cur_bytes) * 8 / (spd * 1e6))
-        nxt = "\n✂️ <b>Next auto-split</b>  in ~%s" % mmss(t_left)
+        if t_left < 1e11:
+            nxt = "\n✂️ <b>Next auto-split</b>  in ~%s  (at %s)" % (mmss(t_left), human(PART_MAX))
     lines = [
         "🔴 <b>Recording</b>  ·  %s" % esc(NAME), "",
         "⏱ <b>Elapsed</b>  %s%s" % (hms(el), ("   ·   left %s" % hms(left)) if left is not None else ""),
@@ -284,8 +442,11 @@ def status_text():
         "⚡ <b>Speed</b>  %.1f Mbps" % spd + nxt,
     ]
     if S["restarts"]:
-        lines.append("♻️ <b>Reconnects</b>  %d" % S["restarts"])
-    lines += ["", '🔗 <a href="%s">Open files</a>' % REL_URL]
+        lines.append("♻️ <b>Reconnects</b>  %d  (files are NOT cut by reconnects)" % S["restarts"])
+        if S["reason"]:
+            lines.append("<code>%s</code>" % esc(S["reason"][:160]))
+    if S["page"]:
+        lines += ["", '📂 <a href="%s">Open the download page</a>' % S["page"]]
     return "\n".join(lines)
 
 
@@ -348,65 +509,32 @@ def poll():
             time.sleep(3)
 
 
-# ---------------- upload ----------------
-def ensure_release(force=False):
-    if DRY or not shutil.which("gh") or not REPO:
-        return True
-    if not force and subprocess.run(["gh", "release", "view", TAG, "--repo", REPO], capture_output=True).returncode == 0:
-        return True
-    cmd = ["gh", "release", "create", TAG, "--repo", REPO, "--title", "Recording " + STAMP, "--notes", NAME]
-    if SHA:
-        cmd += ["--target", SHA]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 and "already exists" not in (r.stderr or ""):
-        S["rel_err"] = (r.stderr or r.stdout or "").strip()[:300]
-        print("gh release create failed:", S["rel_err"], flush=True)
-        return False
-    S["rel_err"] = ""
-    return True
-
-
-def gh_upload(path):
-    if DRY or not shutil.which("gh") or not REPO:
-        print("[dry] would upload", path, human(os.path.getsize(path)))
-        return True, ""
-    err = ""
-    for attempt in range(3):
-        ensure_release()
-        r = subprocess.run(["gh", "release", "upload", TAG, path, "--repo", REPO, "--clobber"], capture_output=True, text=True)
-        if r.returncode == 0:
-            return True, ""
-        err = (r.stderr or r.stdout or "").strip() or S["rel_err"]
-        print("gh release upload failed (try %d): %s" % (attempt + 1, err), flush=True)
-        time.sleep(5 * (attempt + 1))
-    return False, err
-
-
+# ---------------- upload (Gofile) ----------------
 def gofile_upload(path):
     """Upload to Gofile (no account). All files of one recording go into the same folder page."""
     if DRY:
         print("[dry] would upload to gofile", path); return True, "https://gofile.io/d/DRYRUN", ""
     err = ""
-    for attempt in range(3):
-        cmd = ["curl", "-sS", "-m", "3600", "-F", "file=@" + path]
+    for attempt in range(6):
+        cmd = ["nice", "-n", "10", "curl", "-sS", "-m", "3600", "-F", "file=@" + path]   # low priority: never starve the recorder
         if GF["folder"] and GF["token"]:
             cmd += ["-F", "folderId=" + GF["folder"], "-F", "token=" + GF["token"]]
         r = subprocess.run(cmd + [GOFILE_URL], capture_output=True, text=True)
         try:
             j = json.loads(r.stdout)
         except Exception:
-            err = (r.stderr or r.stdout or "no answer").strip()[:200]
-            print("gofile upload failed (try %d): %s" % (attempt + 1, err), flush=True)
-            time.sleep(5 * (attempt + 1)); continue
-        if j.get("status") == "ok":
-            d = j.get("data") or {}
-            GF["folder"] = d.get("parentFolder") or GF["folder"]
-            GF["token"] = d.get("guestToken") or GF["token"]
-            return True, d.get("downloadPage") or "", ""
-        err = json.dumps(j)[:200]
+            err = (r.stderr or r.stdout or "no answer from Gofile").strip()[:200]
+            j = None
+        if j is not None:
+            if j.get("status") == "ok":
+                d = j.get("data") or {}
+                GF["folder"] = d.get("parentFolder") or GF["folder"]
+                GF["token"] = d.get("guestToken") or GF["token"]
+                return True, d.get("downloadPage") or "", ""
+            err = json.dumps(j)[:200]
+            GF["folder"] = GF["token"] = ""          # maybe the folder/token was the problem, start a new folder
         print("gofile upload failed (try %d): %s" % (attempt + 1, err), flush=True)
-        GF["folder"] = GF["token"] = ""             # maybe the folder/token was the problem, start a new folder
-        time.sleep(5 * (attempt + 1))
+        time.sleep(RETRY_BASE * (attempt + 1))
     return False, "", err
 
 
@@ -420,49 +548,12 @@ def media_info(path):
         return 0.0, 0, 0
 
 
-def tg_big(path, caption):
-    """Upload up to ~2 GB to your chat as the bot (MTProto). None = not configured, True = sent, False = failed."""
-    if not (API_ID and API_HASH and TOKEN and CHAT) or DRY:
-        return None
-    if os.path.getsize(path) > BIG_LIMIT:
-        print("File is larger than 1.95 GB, not sending to Telegram.", flush=True)
-        return False
-    try:
-        import asyncio
-        from pyrogram import Client
-    except Exception as e:
-        print("Telegram uploader missing:", e, flush=True)
-        return False
-    dur, w, h = media_info(path)
-    thumb = path + ".jpg"
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "1", "-i", path, "-frames:v", "1", "-vf", "scale=320:-2", thumb], capture_output=True)
-
-    async def go():
-        async with Client("rec", api_id=int(API_ID), api_hash=API_HASH, bot_token=TOKEN, in_memory=True, no_updates=True) as app:
-            if path.endswith(".mp4") and w:
-                kw = dict(caption=caption, supports_streaming=True, duration=int(dur), width=w, height=h)
-                if os.path.exists(thumb):
-                    kw["thumb"] = thumb
-                await app.send_video(int(CHAT), path, **kw)
-            else:
-                await app.send_document(int(CHAT), path, caption=caption)
-    ok = True
-    try:
-        asyncio.run(go())
-    except Exception as e:
-        print("Telegram upload failed:", repr(e), flush=True)
-        ok = False
-    try: os.remove(thumb)
-    except OSError: pass
-    return ok
-
-
 def process(ts):
     """remux the finished .ts to .mp4 (proper duration), upload it, tell Telegram, clean up."""
     os.makedirs(MP4_DIR, exist_ok=True)
     base = os.path.basename(ts)[:-3] + ".mp4"
     mp4 = os.path.join(MP4_DIR, base)
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts, "-c", "copy", "-movflags", "+faststart", mp4],
+    r = subprocess.run(["nice", "-n", "10", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", ts, "-c", "copy", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", mp4],
                        capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(mp4):
         mp4 = ts; base = os.path.basename(ts)
@@ -472,28 +563,13 @@ def process(ts):
     size = os.path.getsize(mp4)
     dur = media_info(mp4)[0]
     n = len(S["done"]) + 1
-    link, err, ok, where_ = "", "", False, "GitHub"
-    if HOST == "gofile":
-        ok, link, err = gofile_upload(mp4); where_ = "Gofile"
-        if not ok and size <= BIG_LIMIT:
-            ok, err2 = gh_upload(mp4); where_ = "GitHub"; link = file_url(base) if ok else ""
-            err = err or err2
-    else:
-        ok, err = gh_upload(mp4); link = file_url(base)
-    big = tg_big(mp4, "%s  ·  %s" % (base, mmss(dur))) if ok else None
+    ok, link, err = gofile_upload(mp4)
     head = "✅ <b>File %d saved</b>\n🎞 %s  ·  %s\n" % (n, mmss(dur), human(size))
     if ok:
-        S["done"].append({"name": base, "size": size, "secs": dur, "url": link, "where": where_})
-        if big:
-            say(head + "📨 Sent here as a video\n⬇️ <a href=\"%s\">Backup copy</a>" % link)
-        elif big is False:
-            say(head + "⚠️ Could not send it to Telegram (see the run log)\n⬇️ <a href=\"%s\">Download this file</a>" % link)
-        else:
-            more = "" if HOST == "gofile" and where_ == "Gofile" else "\n📂 <a href=\"%s\">All files</a>" % REL_URL
-            say(head + "⬇️ <a href=\"%s\">Download%s</a>%s" % (link, " (all files of this recording are on this page)" if where_ == "Gofile" else " this file", more))
-        if big is None and size <= 49 * 1024 * 1024 and TOKEN and CHAT and not DRY:
-            subprocess.run(["curl", "-s", "-F", "chat_id=" + CHAT, "-F", "document=@" + mp4,
-                            "https://api.telegram.org/bot%s/sendDocument" % TOKEN], capture_output=True)
+        if link:
+            S["page"] = link
+        S["done"].append({"name": base, "size": size, "secs": dur})
+        say(head + '⬇️ <a href="%s">Download page</a>  (all files of this recording are listed there)' % (link or S["page"]), buttons=True)
         if not DRY:
             for f in {ts, mp4}:
                 try: os.remove(f)
@@ -502,16 +578,12 @@ def process(ts):
         os.makedirs(FAILED, exist_ok=True)
         try: shutil.move(mp4, os.path.join(FAILED, base))
         except OSError: pass
-        S["done"].append({"name": base, "size": size, "secs": dur, "url": "", "where": "kept"})
-        say("⚠️ <b>Upload failed</b> for %s (%s)\n<b>Reason:</b> <code>%s</code>\n\nThe file is kept. Open the run page, scroll to <b>Artifacts</b> after the run ends and download it:\n%s\n\n"
-            "If the reason says <i>Resource not accessible by integration</i>: Settings > Actions > General > Workflow permissions > Read and write." %
-            (esc(base), human(size), esc((err or "unknown")[:250]), RUN_URL))
+        S["done"].append({"name": base, "size": size, "secs": dur})
+        say("⚠️ <b>Upload to Gofile failed</b> for %s (%s)\n<b>Reason:</b> <code>%s</code>\n\nThe file is still on the GitHub server until the run ends. If this keeps happening, try again later." %
+            (esc(base), human(size), esc((err or "unknown")[:250])))
 
 
 def uploader():
-    ensure_release()
-    if S["rel_err"]:
-        say("⚠️ Could not create the GitHub release: <code>%s</code>" % esc(S["rel_err"]))
     while True:
         item = upq.get()
         if item is None:
@@ -543,6 +615,29 @@ def explain(err):
     return "Unknown reason. Read the ffmpeg line above."
 
 
+KIND = "hls"                                       # "hls" (.m3u8 playlist) or "ts" (live MPEG-TS over HTTP)
+
+
+def kind_from_url():
+    u = URL.lower()
+    path = u.split("?")[0]
+    if "m3u8" in u:
+        return "hls"
+    if path.endswith((".ts", ".mpegts", ".mts", ".m2ts")):
+        return "ts"
+    return "?"
+
+
+def probe_kind():
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-rw_timeout", "20000000"] + HDR + ["-show_entries", "format=format_name", "-of", "csv=p=0", URL],
+                           capture_output=True, text=True, timeout=60)
+        names = (r.stdout or "").lower()
+    except Exception:
+        names = ""
+    return "hls" if ("hls" in names or "applehttp" in names) else "ts"
+
+
 def header_sets():
     sets = []
     if REFERER:
@@ -552,6 +647,9 @@ def header_sets():
     o = _origin(URL)
     if o:
         sets.append(("browser headers with the stream's own site as referer", ["-user_agent", UA, "-referer", o + "/", "-headers", "Origin: %s\r\n" % o]))
+    if kind_from_url() != "hls":
+        sets.append(("a VLC player User-Agent", ["-user_agent", "VLC/3.0.20 LibVLC/3.0.20"]))   # IPTV servers often expect a player
+        sets.append(("the default ffmpeg User-Agent", []))
     return sets
 
 
@@ -566,11 +664,50 @@ def precheck():
             last = str(e); continue
         if r.returncode == 0:
             HDR = hdr
-            print("Link opened using: " + label, flush=True)
+            global KIND
+            KIND = kind_from_url()
+            if KIND == "?":
+                KIND = probe_kind()
+            forced = (E("STREAM_TYPE") or "auto").lower()
+            if forced in ("hls", "ts"):
+                KIND = forced
+            print("Link opened using: %s | stream type: %s" % (label, "MPEG-TS (live)" if KIND == "ts" else "HLS (.m3u8)"), flush=True)
             return True, ""
         last = mask((r.stderr or "").strip())[-400:]
         print("Could not open with %s: %s" % (label, last.splitlines()[-1] if last else "?"), flush=True)
     return False, last
+
+
+def ask_link():
+    """URL = "ask": wait for the m3u8 link in Telegram, so a public repo never shows it."""
+    global URL, ASKED
+    r = tg("getUpdates", timeout=0)
+    if r.get("error_code") == 409:
+        print("::error title=Cannot read the link::A webhook is set on the bot. Paste the link in the Run workflow form instead.", flush=True)
+        sys.exit(1)
+    off = 0
+    for u in r.get("result", []):
+        off = u["update_id"] + 1
+    say("🔗 <b>Send me the stream link</b> (.m3u8 or .ts address) as a normal message.\nI wait 15 minutes. The link stays only in this chat.")
+    deadline = time.time() + 15 * 60
+    while time.time() < deadline:
+        r = tg("getUpdates", offset=off, timeout=20)
+        for u in r.get("result", []):
+            off = u["update_id"] + 1
+            m = u.get("message") or {}
+            if str((m.get("chat") or {}).get("id")) != str(CHAT):
+                continue
+            f = re.search(r"https?://\S+", m.get("text") or "")
+            if f:
+                URL = f.group(0).strip("<>\"'"); ASKED = True
+                print("::add-mask::" + URL, flush=True)      # hide it in every log line from now on
+                say("✅ <b>Link received.</b> Checking it...")
+                return
+        if not r:
+            time.sleep(3)
+    say("⏰ No link came in 15 minutes, so I stopped. Run the workflow again when you are ready.")
+    print("::error title=No link received::Nothing was sent in 15 minutes.", flush=True)
+    sys.exit(1)
 
 
 def where():
@@ -586,11 +723,21 @@ def chain(rem_minutes):
     if stop.is_set() or not shutil.which("gh"):
         return
     say("⏳ The 6 hour job limit is near. Starting the next run to continue...")
-    cmd = ["gh", "workflow", "run", "record.yml", "--repo", REPO, "-f", "url=" + URL, "-f", "minutes=%d" % rem_minutes,
+    if ASKED:
+        say("🔁 A new run starts now. <b>Send the stream link again</b> when it asks, so the link is never shown on GitHub.")
+    cmd = ["gh", "workflow", "run", "record.yml", "--repo", REPO, "-f", "url=" + ("ask" if ASKED else URL), "-f", "minutes=%d" % rem_minutes,
            "-f", "name=" + NAME, "-f", "part_min=%s" % PART_MIN, "-f", "part_mb=%d" % (PART_MAX / 1e6)]
     if REFERER:
         cmd += ["-f", "referer=" + REFERER]
     subprocess.run(cmd)
+
+
+def why_exit(rc, lines):
+    text = [l.strip() for l in lines if l.strip()]
+    key = re.compile(r"error|failed|timed out|timeout|refused|forbidden|not found|invalid data|end of file|server returned|reset", re.I)
+    hit = [l for l in text if key.search(l)]
+    reason = mask((hit or text or ["no message"])[-1])[:180]
+    return "exit code %s: %s" % (rc, reason)
 
 
 def stderr_reader(p, box):
@@ -603,6 +750,11 @@ def record():
     global SP
     os.makedirs(OUT, exist_ok=True)
     detect_chat()
+    if URL.strip().lower() in ("", "ask", "telegram"):
+        if not (TOKEN and CHAT) and not DRY:
+            print("::error title=No Telegram chat::Send 'hi' to your bot first, then run again.", flush=True)
+            sys.exit(1)
+        ask_link()
     ok, err = precheck()
     if not ok:
         why = explain(err)
@@ -612,8 +764,10 @@ def record():
         say("❌ <b>The link could not be opened from GitHub's server</b>\n<b>Reason:</b> %s\n\n<code>%s</code>" % (esc(why), esc(err[-300:])))
         sys.exit(1)
     plan = ("stops after %d min" % MINUTES) if MINUTES else "runs until you press Stop"
-    say("🔴 <b>Recording started</b>\n🎬 %s\n⏱ %s\n✂️ New file every %g min (max %s)\n📍 GitHub server: %s\n🔗 <a href=\"%s\">Files will appear here</a>" %
-        (esc(NAME), plan, PART_MIN, human(PART_MAX), esc(where()), REL_URL), buttons=True)
+    kind_txt = "📡 <b>MPEG-TS live stream</b> (starts now, no rewind)" if KIND == "ts" else "📡 HLS stream"
+    every = "every %s%s" % (human(PART_MAX), (" or %g min" % PART_MIN) if PART_MIN > 0 else "")
+    say("🔴 <b>Recording started</b>\n🎬 %s\n%s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 GitHub server: %s\nThe first download link comes after the first file is full." %
+        (esc(NAME), kind_txt, plan, every, esc(where())), buttons=True)
     signal.signal(signal.SIGINT, lambda *a: halt())
     signal.signal(signal.SIGTERM, lambda *a: halt())
     total = MINUTES * 60
@@ -627,49 +781,98 @@ def record():
     SP.on_manual = lambda n: say("✂️ <b>Split done</b>\nFile #%d started. Recording continues." % n, buttons=True)
     end_at = S["t0"] + (min(total, LIMIT) if total else LIMIT)
 
+    # The reader (below) only moves bytes from ffmpeg into this queue. The splitter works on the other side.
+    # So a slow disk, a busy CPU or an upload can never make the pipe full and the server drop the connection.
+    rq = queue.Queue(maxsize=4000)
+
+    def consumer():
+        while True:
+            it = rq.get()
+            if it is None:
+                return
+            try:
+                if it[0] == "d":
+                    SP.feed(it[1])
+                else:
+                    SP.new_session(dedupe=it[1], verify=it[2])
+            except Exception as e:
+                print("splitter error:", repr(e), flush=True)
+                SP.buf = b""
+    ct = threading.Thread(target=consumer)
+    ct.start()
+
     def watchdog():
         while not stop.is_set():
             if time.time() >= end_at:
                 halt(); return
+            if IDLE_STOP > 0 and time.time() - SP.last_es > IDLE_STOP * 60:
+                say("⏹ <b>The stream sent no data for %g minutes</b>, so the match has probably ended.\nSaving what I have and ending the job to save your GitHub minutes." % IDLE_STOP)
+                halt(); return
             time.sleep(2)
     threading.Thread(target=watchdog, daemon=True).start()
 
-    last_err = []
+    def stream_monitor():
+        warned, since = False, 0
+        while not stop.is_set():
+            idle = time.time() - SP.last_es
+            if not warned and idle > 90:
+                warned, since = True, time.time() - idle
+                say("⚠️ <b>The stream has not sent data for %s.</b>\nStill trying. Short breaks are repaired automatically." % mmss(idle))
+            elif warned and idle < 15:
+                warned = False
+                say("✅ <b>Stream is back</b> after %s. Recording continues in the same file." % mmss(time.time() - since))
+            time.sleep(5)
+    threading.Thread(target=stream_monitor, daemon=True).start()
+
+    last_err = []; first = True; consec = 0
     while not stop.is_set():
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-rw_timeout", "30000000", "-live_start_index", "-" + BACK] + HDR + [
-               "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
+        if KIND == "ts":
+            # no ffmpeg-internal reconnect: after a drop a NEW ffmpeg starts quickly (small probe), and the splitter
+            # joins the timeline, so a restarted server clock does not matter
+            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "20000000",
+                      "-probesize", "2000000", "-analyzeduration", "1500000"]
+        else:
+            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1",
+                      "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
+                      "-http_persistent", "0", "-live_start_index", ("-" + BACK) if first else ("-" + RECON_BACK)]
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"] + inopts + HDR + [
+               "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
+               "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
+        first = False
+        t_run = time.time()
         p = S["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        if fcntl:
+            try: fcntl.fcntl(p.stdout.fileno(), 1031, 1 << 20)       # F_SETPIPE_SZ: 1 MB pipe
+            except Exception: pass
         last_err = []
         threading.Thread(target=stderr_reader, args=(p, last_err), daemon=True).start()
         while True:
-            data = p.stdout.read(188 * 1024)
+            data = p.stdout.read(1 << 20)
             if not data:
                 break
-            SP.feed(data)
+            rq.put(("d", data)); S["last_data"] = time.time()
+            S["qmax"] = max(S["qmax"], rq.qsize())
         p.wait()
         if stop.is_set() or TEST_ONCE:
             break
         S["restarts"] += 1
-        SP.want_split = True                          # after a reconnect the picture restarts: begin a new file
-        if S["restarts"] == 1 or S["restarts"] % 5 == 0:
-            say("♻️ <b>Stream dropped or ended</b>, reconnecting (%d)...\n<code>%s</code>" % (S["restarts"], esc(mask("".join(last_err)).strip()[-200:])))
-        time.sleep(5)
+        rq.put(("n", True, KIND == "ts"))                    # processed in order, after the data already queued
+        S["reason"] = why_exit(p.returncode, last_err)
+        consec = 0 if time.time() - t_run > 30 else consec + 1
+        print("Reconnect %d (queue peak %d): %s" % (S["restarts"], S["qmax"], S["reason"]), flush=True)   # log only, no Telegram spam
+        time.sleep(min(0.5 + 0.5 * consec, 5))
+    rq.put(None)
+    ct.join()
     SP.finish()
     upq.put(None)
     up.join()
     saved = sum(d["size"] for d in S["done"])
-    summary("## Recording finished\n%d file(s), %s. [Open the release](%s)" % (len(S["done"]), human(saved), REL_URL))
-    if HOST == "gofile" and any(d.get("where") == "Gofile" for d in S["done"]):
-        page = next(d["url"] for d in S["done"] if d.get("where") == "Gofile")
-        rows = ["%d.  %s  ·  %s" % (i + 1, human(d["size"]), mmss(d["secs"])) for i, d in enumerate(S["done"][:30])]
-        links = "\n\n📂 <a href=\"%s\">Download all files (one page)</a>" % page
-    else:
-        rows = ["%d. <a href=\"%s\">%s  ·  %s</a>" % (i + 1, d.get("url") or file_url(d["name"]), human(d["size"]), mmss(d["secs"])) for i, d in enumerate(S["done"][:30])]
-        links = "\n\n📂 <a href=\"%s\">Open the release page</a>" % REL_URL
-    if len(S["done"]) > 30:
-        rows.append("... and %d more" % (len(S["done"]) - 30))
+    page = S["page"]
+    summary("## Recording finished\n%d file(s), %s. %s" % (len(S["done"]), human(saved), ("[Download page](%s)" % page) if page else ""))
+    rows = "\n".join("%d.  %s  ·  %s" % (i + 1, human(d["size"]), mmss(d["secs"])) for i, d in enumerate(S["done"][:30]))
     say("🏁 <b>Recording finished</b>\n🎬 %s\n📁 %d file(s)  ·  %s\n⏱ %s\n\n%s%s" %
-        (esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), "\n".join(rows), links))
+        (esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), rows,
+         ('\n\n📂 <a href="%s">Download all files (one page)</a>' % page) if page else "\n\n⚠️ No file could be uploaded. See the run log."))
 
 
 def finish():
@@ -677,13 +880,10 @@ def finish():
     leftovers = sorted(glob.glob(os.path.join(OUT, "*.ts")))
     if not leftovers:
         return
-    ensure_release()
     for f in leftovers:
         process(f)
-    say("⚠️ <b>Recording was interrupted.</b> Saved %d leftover file(s).\n🔗 <a href=\"%s\">Download</a>" % (len(leftovers), REL_URL))
+    say("⚠️ <b>Recording was interrupted.</b> Saved %d leftover file(s).%s" % (len(leftovers), ('\n📂 <a href="%s">Download page</a>' % S["page"]) if S["page"] else ""))
 
 
 if __name__ == "__main__":
-    if not URL:
-        sys.exit("URL env var is empty")
     finish() if len(sys.argv) > 1 and sys.argv[1] == "finish" else record()
